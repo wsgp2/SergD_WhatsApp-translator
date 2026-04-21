@@ -1,0 +1,20 @@
+{
+  "name": "sergd-whatsapp-translator",
+  "version": "1.0.0",
+  "description": "WhatsApp translator bot with AssemblyAI transcription + GPT-5.4-mini translation + gpt-4o-mini-tts",
+  "main": "translator.js",
+  "scripts": {
+    "start": "node translator.js"
+  },
+  "keywords": ["whatsapp", "translator", "bot", "openai", "assemblyai"],
+  "author": "SergD",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "assemblyai": "^4.30.0",
+    "dotenv": "^16.4.5",
+    "openai": "^6.34.0",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.34.6"
+  }
+}

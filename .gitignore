@@ -1,0 +1,42 @@
+# Environment
+.env
+.env.local
+
+# WhatsApp session data (contains auth, never commit)
+.wwebjs_auth/
+.wwebjs_cache/
+
+# Node
+node_modules/
+package-lock.json
+npm-debug.log
+yarn-error.log
+
+# Bot state files
+translator_settings.json
+chat_settings.json
+usage_stats.json
+
+# Logs
+logs/
+*.log
+
+# Backups
+*.bak
+*.backup
+*.backup_*
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Temp
+/tmp/
+tmp/
+*.tmp
+
+# Audio test files
+test_audio/
+wa_audio_*
+wa_my_audio_*
