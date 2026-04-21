@@ -245,11 +245,4 @@ journalctl -u wa-translator -f
 
 ## Связь с Telegram-версией
 
-Telegram-бот переводчика работает на сервере `168.110.208.184` (Oracle Cloud):
-```
-ssh ubuntu@168.110.208.184
-# или через Tailscale: ssh ubuntu@100.108.4.11
-Путь: /home/ubuntu/bots/telegram_voice_translator/
-```
-
-WhatsApp-версия использует те же API ключи и ту же логику перевода, но другую транспортную обёртку (whatsapp-web.js вместо python-telegram-bot).
+Существует Telegram-версия этого же переводчика — использует ту же логику перевода (AssemblyAI + GPT-5.4-mini + gpt-4o-mini-tts), но другую транспортную обёртку: `python-telegram-bot` вместо `whatsapp-web.js`.

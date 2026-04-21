@@ -113,5 +113,4 @@ TTS включён? → generateAudio() → gpt-4o-mini-tts → голосово
 
 ## См. также
 
-- Telegram-версия переводчика: работает на том же сервере в `/home/ubuntu/bots/telegram_voice_translator/`
 - [DEPLOY.md](./DEPLOY.md) — детальная документация по развёртыванию
