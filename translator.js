@@ -178,10 +178,18 @@ const client = new Client({
   authStrategy: new LocalAuth({ dataPath: path.join(__dirname, '.wwebjs_auth') }),
   puppeteer: {
     headless: true,
-    executablePath: "/usr/bin/chromium-browser",
+    executablePath: "/usr/bin/brave-browser",
+    ignoreDefaultArgs: ['--enable-automation'],
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-           '--disable-gpu', '--disable-extensions', '--single-process']
+           '--disable-gpu', '--disable-extensions', '--single-process',
+           '--disable-blink-features=AutomationControlled',
+           '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36']
   },
+  webVersionCache: {
+    type: 'remote',
+    remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/{version}.html'
+  },
+  webVersion: '2.3000.1039092809-alpha',
   restartOnAuthFail: true
 });
 
@@ -196,12 +204,41 @@ client.on('auth_failure', (msg) => {
   console.log(`[!] Auth failed: ${msg}. Удали .wwebjs_auth/ и пересканируй.`);
 });
 
+// Exponential backoff против reconnect-storm (триггерит WhatsApp LOGOUT)
+let reconnectAttempt = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
+const BACKOFF_MS = [30_000, 60_000, 120_000, 300_000, 900_000]; // 30s, 1m, 2m, 5m, 15m
+
 client.on('disconnected', (reason) => {
-  console.log(`[!] Отключён: ${reason}`);
+  const reasonStr = String(reason || '');
+  console.log(`[!] Отключён: ${reasonStr}`);
+
+  // LOGOUT/UNPAIRED — это решение сервера, retry → ban escalation
+  if (/LOGOUT|UNPAIRED|FORBIDDEN/i.test(reasonStr)) {
+    console.log('[!] WhatsApp выкинул сессию принудительно. Не реконнекчусь — это эскалирует бан.');
+    console.log('[!] Удали .wwebjs_auth/ и пересканируй QR. systemd подхватит на старте.');
+    setTimeout(() => process.exit(1), 500);
+    return;
+  }
+
   if (reconnecting) return;
+  if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+    console.log(`[!] Достигнут лимит реконнектов (${MAX_RECONNECT_ATTEMPTS}). Выхожу, systemd рестартует с задержкой.`);
+    setTimeout(() => process.exit(1), 500);
+    return;
+  }
   reconnecting = true;
-  setTimeout(() => { reconnecting = false; client.initialize(); }, 5000);
+  const delay = BACKOFF_MS[reconnectAttempt];
+  reconnectAttempt++;
+  console.log(`[~] Попытка реконнекта ${reconnectAttempt}/${MAX_RECONNECT_ATTEMPTS} через ${delay/1000}s`);
+  setTimeout(() => {
+    reconnecting = false;
+    client.initialize();
+  }, delay);
 });
+
+// При успешном ready сбрасываем счётчик попыток
+client.on('ready', () => { reconnectAttempt = 0; });
 
 client.on('ready', async () => {
   console.log('\n=== WhatsApp Translator подключён! ===\n');
@@ -605,6 +642,8 @@ loadSettings();
 
 process.on('unhandledRejection', (err) => {
   console.error('[!] Unhandled rejection:', err);
+  // exit с failure чтобы systemd применил RestartSec (важно для snap chromium scope drain)
+  setTimeout(() => process.exit(1), 100);
 });
 
 console.log('Подключение к WhatsApp...\n');
