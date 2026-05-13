@@ -1,10 +1,18 @@
 require('dotenv').config();
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  DisconnectReason,
+  downloadMediaMessage,
+} = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
 const qrcode = require('qrcode-terminal');
+const pino = require('pino');
 const OpenAI = require('openai');
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
+const os = require('os');
 
 // === КОНФИГУРАЦИЯ ===
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -16,12 +24,13 @@ if (!OPENAI_API_KEY || !ASSEMBLYAI_KEY) {
 }
 
 const SETTINGS_FILE = path.join(__dirname, 'translator_settings.json');
-const MY_LANG = 'ru'; // Мой язык — русский
+const AUTH_DIR = path.join(__dirname, '.baileys_auth');
+const MY_LANG = 'ru';
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 // === НАСТРОЙКИ PER-CHAT ===
-let chatSettings = {}; // chatId -> { enabled: true, targetLang: 'en', tts: false }
+let chatSettings = {};
 
 function loadSettings() {
   if (fs.existsSync(SETTINGS_FILE)) {
@@ -46,16 +55,14 @@ function detectLanguage(text) {
   const total = text.replace(/\s/g, '').length;
   if (total === 0) return 'en';
   if (cyrillic / total > 0.3) return 'ru';
-  return 'unknown'; // GPT определит точнее при переводе
+  return 'unknown';
 }
 
 // === ТРАНСКРИПЦИЯ АУДИО (AssemblyAI primary + Whisper fallback) ===
 async function transcribeAudio(filePath) {
-  // AssemblyAI через REST API (SDK глючит с speech_models)
   try {
     console.log(`  [aai] Транскрибация: ${filePath}`);
 
-    // Upload
     const uploadResp = await fetch('https://api.assemblyai.com/v2/upload', {
       method: 'POST',
       headers: { 'authorization': ASSEMBLYAI_KEY },
@@ -63,7 +70,6 @@ async function transcribeAudio(filePath) {
     });
     const { upload_url } = await uploadResp.json();
 
-    // Transcribe
     const txResp = await fetch('https://api.assemblyai.com/v2/transcript', {
       method: 'POST',
       headers: { 'authorization': ASSEMBLYAI_KEY, 'content-type': 'application/json' },
@@ -76,7 +82,6 @@ async function transcribeAudio(filePath) {
     const tx = await txResp.json();
     if (!tx.id) throw new Error(tx.error || 'No transcript ID');
 
-    // Poll до готовности (макс 60 сек)
     for (let i = 0; i < 20; i++) {
       await new Promise(r => setTimeout(r, 3000));
       const pollResp = await fetch('https://api.assemblyai.com/v2/transcript/' + tx.id, {
@@ -95,7 +100,6 @@ async function transcribeAudio(filePath) {
     console.error(`  [aai] Ошибка: ${err.message}, fallback на Whisper`);
   }
 
-  // Whisper fallback
   console.log(`  [whisper] Fallback транскрибация...`);
   const audioFile = fs.createReadStream(filePath);
   const response = await openai.audio.transcriptions.create({
@@ -168,154 +172,105 @@ async function generateAudio(text, lang) {
   });
 
   const buffer = Buffer.from(await response.arrayBuffer());
-  const tmpFile = path.join(require('os').tmpdir(), `tts_${Date.now()}.mp3`);
+  const tmpFile = path.join(os.tmpdir(), `tts_${Date.now()}.mp3`);
   fs.writeFileSync(tmpFile, buffer);
   return tmpFile;
 }
 
-// === WHATSAPP CLIENT ===
-const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: path.join(__dirname, '.wwebjs_auth') }),
-  puppeteer: {
-    headless: true,
-    executablePath: "/usr/bin/brave-browser",
-    ignoreDefaultArgs: ['--enable-automation'],
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-           '--disable-gpu', '--disable-extensions', '--single-process',
-           '--disable-blink-features=AutomationControlled',
-           '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36']
-  },
-  webVersionCache: {
-    type: 'remote',
-    remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/{version}.html'
-  },
-  webVersion: '2.3000.1039092809-alpha',
-  restartOnAuthFail: true
-});
+// === HELPERS: JID + СООБЩЕНИЯ ===
 
-let reconnecting = false;
+// Извлечь текст из Baileys message
+function extractText(msg) {
+  return msg.message?.conversation
+      || msg.message?.extendedTextMessage?.text
+      || msg.message?.imageMessage?.caption
+      || msg.message?.videoMessage?.caption
+      || '';
+}
 
-client.on('qr', (qr) => {
-  console.log('\n=== СКАНИРУЙ QR КОД ===\n');
-  qrcode.generate(qr, { small: true });
-});
+// Какое медиа в сообщении (если есть audio/ptt/video — для транскрипции)
+function getAudioMedia(msg) {
+  return msg.message?.audioMessage
+      || msg.message?.pttMessage
+      || msg.message?.videoMessage
+      || null;
+}
 
-client.on('auth_failure', (msg) => {
-  console.log(`[!] Auth failed: ${msg}. Удали .wwebjs_auth/ и пересканируй.`);
-});
-
-// Exponential backoff против reconnect-storm (триггерит WhatsApp LOGOUT)
-let reconnectAttempt = 0;
-const MAX_RECONNECT_ATTEMPTS = 5;
-const BACKOFF_MS = [30_000, 60_000, 120_000, 300_000, 900_000]; // 30s, 1m, 2m, 5m, 15m
-
-client.on('disconnected', (reason) => {
-  const reasonStr = String(reason || '');
-  console.log(`[!] Отключён: ${reasonStr}`);
-
-  // LOGOUT/UNPAIRED — это решение сервера, retry → ban escalation
-  if (/LOGOUT|UNPAIRED|FORBIDDEN/i.test(reasonStr)) {
-    console.log('[!] WhatsApp выкинул сессию принудительно. Не реконнекчусь — это эскалирует бан.');
-    console.log('[!] Удали .wwebjs_auth/ и пересканируй QR. systemd подхватит на старте.');
-    setTimeout(() => process.exit(1), 500);
-    return;
+// Нормализация JID для поиска в settings (по номеру без суффикса)
+function getChatSettingsForId(chatId) {
+  if (chatSettings[chatId]) return chatSettings[chatId];
+  // Старые wwjs ключи: 1234@c.us; новые Baileys: 1234@s.whatsapp.net; @lid тоже бывает
+  const num = chatId.replace(/@.*$/, '').replace(/:\d+$/, '');
+  for (const [key, val] of Object.entries(chatSettings)) {
+    const keyNum = key.replace(/@.*$/, '').replace(/:\d+$/, '');
+    if (keyNum === num) return val;
   }
-
-  if (reconnecting) return;
-  if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
-    console.log(`[!] Достигнут лимит реконнектов (${MAX_RECONNECT_ATTEMPTS}). Выхожу, systemd рестартует с задержкой.`);
-    setTimeout(() => process.exit(1), 500);
-    return;
-  }
-  reconnecting = true;
-  const delay = BACKOFF_MS[reconnectAttempt];
-  reconnectAttempt++;
-  console.log(`[~] Попытка реконнекта ${reconnectAttempt}/${MAX_RECONNECT_ATTEMPTS} через ${delay/1000}s`);
-  setTimeout(() => {
-    reconnecting = false;
-    client.initialize();
-  }, delay);
-});
-
-// При успешном ready сбрасываем счётчик попыток
-client.on('ready', () => { reconnectAttempt = 0; });
-
-client.on('ready', async () => {
-  console.log('\n=== WhatsApp Translator подключён! ===\n');
-
-  // Catchup пропущенных
-  await catchUpTranslations();
-
-  console.log('Команды в чате:');
-  console.log('  #translate      — включить переводчик');
-  console.log('  #translate en   — включить + язык ответов');
-  console.log('  #stop           — выключить');
-  console.log('  #tts on/off     — озвучка');
-  console.log('  #status         — настройки чата\n');
-
-  console.log('Терминал:');
-  console.log('  status          — все чаты с переводом');
-  console.log('  quit            — выход\n');
-  if (process.stdin.isTTY) { promptUser(); }
-});
+  return null;
+}
 
 // === ОБРАБОТКА КОМАНД В ЧАТЕ ===
 function isCommand(body) {
   return body && body.startsWith('#');
 }
 
-async function handleCommand(msg) {
-  const body = msg.body.trim().toLowerCase();
-  const chatId = msg.from;
+async function handleCommand(sock, msg, body) {
+  const chatId = msg.key.remoteJid;
+  const cmd = body.trim().toLowerCase();
 
-  if (body === '#translate' || body.startsWith('#translate ')) {
-    const parts = body.split(' ');
+  if (cmd === '#translate' || cmd.startsWith('#translate ')) {
+    const parts = cmd.split(' ');
     const lang = parts[1] || 'en';
     chatSettings[chatId] = { enabled: true, targetLang: lang, tts: false };
     saveSettings();
-    await msg.reply(`🌐 Translator ON\n→ Your messages will be translated to: ${lang}\n→ Incoming messages → Russian\n\nCommands: #stop, #tts on, #status`);
+    await sock.sendMessage(chatId, {
+      text: `🌐 Translator ON\n→ Your messages will be translated to: ${lang}\n→ Incoming messages → Russian\n\nCommands: #stop, #tts on, #status`
+    }, { quoted: msg });
     console.log(`[+] Переводчик ВКЛ для ${chatId} (→${lang})`);
     return true;
   }
 
-  if (body === '#stop') {
+  if (cmd === '#stop') {
     if (chatSettings[chatId]) {
       chatSettings[chatId].enabled = false;
       saveSettings();
     }
-    await msg.reply('🔴 Translator OFF');
+    await sock.sendMessage(chatId, { text: '🔴 Translator OFF' }, { quoted: msg });
     console.log(`[-] Переводчик ВЫКЛ для ${chatId}`);
     return true;
   }
 
-  if (body === '#tts on') {
+  if (cmd === '#tts on') {
     const s = chatSettings[chatId] || getChatSettingsForId(chatId);
     if (s) {
       s.tts = true;
       chatSettings[chatId] = s;
       saveSettings();
-      await msg.reply('🔊 TTS ON — переводы будут озвучиваться');
+      await sock.sendMessage(chatId, { text: '🔊 TTS ON — переводы будут озвучиваться' }, { quoted: msg });
     }
     return true;
   }
 
-  if (body === '#tts off') {
+  if (cmd === '#tts off') {
     const s = chatSettings[chatId] || getChatSettingsForId(chatId);
     if (s) {
       s.tts = false;
       chatSettings[chatId] = s;
       saveSettings();
-      await msg.reply('🔇 TTS OFF');
+      await sock.sendMessage(chatId, { text: '🔇 TTS OFF' }, { quoted: msg });
     }
     return true;
   }
 
-  if (body === '#status') {
+  if (cmd === '#status') {
     const s = getChatSettingsForId(chatId);
     if (s && s.enabled) {
-      await msg.reply(`🌐 Translator: ON\n🎯 Target lang: ${s.targetLang}\n🔊 TTS: ${s.tts ? 'ON' : 'OFF'}`);
+      await sock.sendMessage(chatId, {
+        text: `🌐 Translator: ON\n🎯 Target lang: ${s.targetLang}\n🔊 TTS: ${s.tts ? 'ON' : 'OFF'}`
+      }, { quoted: msg });
     } else {
-      await msg.reply('🔴 Translator: OFF\nSend #translate to enable');
+      await sock.sendMessage(chatId, {
+        text: '🔴 Translator: OFF\nSend #translate to enable'
+      }, { quoted: msg });
     }
     return true;
   }
@@ -323,18 +278,17 @@ async function handleCommand(msg) {
   return false;
 }
 
-// === ОБРАБОТКА СООБЩЕНИЙ ===
+// === ДЕБАУНС И ОЧЕРЕДЬ ===
 const processingChats = new Set();
-const recentlyTranslated = new Map(); // дебаунс: chatId -> timestamp
+const recentlyTranslated = new Map();
 
 function isDuplicate(chatId, text) {
   const key = `${chatId}:${(text || '').substring(0, 50)}`;
   const now = Date.now();
   if (recentlyTranslated.has(key) && now - recentlyTranslated.get(key) < 30000) {
-    return true; // тот же текст за последние 30 сек — дубль
+    return true;
   }
   recentlyTranslated.set(key, now);
-  // Чистим старые записи
   if (recentlyTranslated.size > 100) {
     for (const [k, v] of recentlyTranslated) {
       if (now - v > 60000) recentlyTranslated.delete(k);
@@ -343,267 +297,314 @@ function isDuplicate(chatId, text) {
   return false;
 }
 
-// Получить chatId для поиска настроек (поддержка @c.us и @lid)
-function getChatSettingsForId(chatId) {
-  if (chatSettings[chatId]) return chatSettings[chatId];
-  // Пробуем найти по номеру без суффикса
-  const num = chatId.replace(/@.*$/, '');
-  for (const [key, val] of Object.entries(chatSettings)) {
-    if (key.replace(/@.*$/, '') === num) return val;
-  }
-  return null;
-}
-
-client.on('message', async (msg) => {
-  if (msg.from === 'status@broadcast') return;
-  if (msg.fromMe) return;
-
-  const chatId = msg.from;
-  const settings = getChatSettingsForId(chatId);
-
-  if (!settings || !settings.enabled) return;
-  if (!msg.body && !msg.hasMedia) return;
-
-  // Дебаунс — не переводим дубли
-  if (isDuplicate(chatId, msg.body)) {
-    console.log(`  [skip] Дубль от ${chatId}`);
-    return;
-  }
-
-  // Защита от параллельной обработки одного чата
-  if (processingChats.has(chatId)) return;
-  processingChats.add(chatId);
-
-  try {
-    await processMessage(msg, settings);
-  } catch (err) {
-    console.error(`[!] Ошибка обработки: ${err.message}`);
-  } finally {
-    processingChats.delete(chatId);
-  }
-});
-
-// Исходящие сообщения (мои)
-client.on('message_create', async (msg) => {
-  if (!msg.fromMe) return;
-
-  const chatId = msg.to;
-
-  // Команды от меня — обрабатываем
-  if (msg.body && isCommand(msg.body)) {
-    // Подменяем msg.from на chatId для handleCommand
-    const origFrom = msg.from;
-    msg.from = chatId;
-    await handleCommand(msg);
-    msg.from = origFrom;
-    return;
-  }
-
-  const settings = getChatSettingsForId(chatId);
-  if (!settings || !settings.enabled) return;
-
-  // Не переводим если это уже перевод от бота или отредактированное
-  if (msg.body && (msg.body.startsWith('🌐') || msg.body.startsWith('📝'))) return;
-  if (msg.latestEditSenderTimestampMs) return; // пропускаем edited сообщения
-
-  // Защита от параллельной обработки
-  if (processingChats.has(chatId + '_out')) return;
-  processingChats.add(chatId + '_out');
-
-  try {
-    // Моё аудио → транскрипция + перевод на язык чата
-    if (msg.hasMedia && (msg.type === 'audio' || msg.type === 'ptt' || msg.type === 'video')) {
-      const media = await msg.downloadMedia();
-      if (media) {
-        const tmpFile = path.join(require('os').tmpdir(), `wa_my_audio_${Date.now()}.ogg`);
-        fs.writeFileSync(tmpFile, Buffer.from(media.data, 'base64'));
-
-        console.log(`[>>] Моё аудио, транскрибация...`);
-        const result = await transcribeAudio(tmpFile);
-        try { fs.unlinkSync(tmpFile); } catch (e) {}
-
-        if (result.text && result.text.trim()) {
-          // Переводим на язык чата
-          let translationResult = await translateText(result.text, result.lang || 'ru', settings.targetLang);
-          let translation = translationResult.text;
-          translation = translation.replace(/\.$/,'');
-          await client.sendMessage(chatId, `🌐 ${translation}`);
-          console.log(`[>>] Моё аудио (${result.lang}→${settings.targetLang}): ${translation.substring(0, 80)}`);
-        }
-      }
-    }
-    // Мой текст на русском → заменяем оригинал на перевод
-    else if (msg.body && msg.body.trim()) {
-      const sourceLang = detectLanguage(msg.body);
-      if (sourceLang === MY_LANG) {
-        let translationResult = await translateText(msg.body, 'ru', settings.targetLang);
-        let translation = translationResult.text;
-        translation = translation.replace(/\.$/,''); // убираем точку в конце
-        // @c.us → edit оригинал, @lid → новое сообщение
-        if (chatId.endsWith('@c.us')) {
-          try {
-            const editResult = await msg.edit(translation);
-            if (editResult) {
-              console.log(`[>>] EDIT (ru→${settings.targetLang}): ${translation.substring(0, 80)}`);
-            } else {
-              await client.sendMessage(chatId, `🌐 ${translation}`);
-              console.log(`[>>] Мой текст (ru→${settings.targetLang}): ${translation.substring(0, 80)}`);
-            }
-          } catch (e) {
-            await client.sendMessage(chatId, `🌐 ${translation}`);
-            console.log(`[>>] Мой текст (ru→${settings.targetLang}): ${translation.substring(0, 80)}`);
-          }
-        } else {
-          await client.sendMessage(chatId, `🌐 ${translation}`);
-          console.log(`[>>] Мой текст (ru→${settings.targetLang}): ${translation.substring(0, 80)}`);
-        }
-      }
-    }
-  } catch (err) {
-    console.error(`[!] Ошибка перевода исходящего: ${err.message}`);
-  } finally {
-    processingChats.delete(chatId + '_out');
-  }
-});
-
-async function processMessage(msg, settings) {
-  let text = msg.body || '';
+// === ОБРАБОТКА ВХОДЯЩЕГО (от собеседника) ===
+async function processIncoming(sock, msg, settings) {
+  const chatId = msg.key.remoteJid;
+  let text = extractText(msg);
   let detectedLang = '';
+  const audioMedia = getAudioMedia(msg);
 
-  // Аудио сообщение
-  if (msg.hasMedia) {
-    const media = await msg.downloadMedia();
-    if (media && (msg.type === 'audio' || msg.type === 'ptt' || msg.type === 'video')) {
-      // Сохраняем во временный файл
-      const tmpFile = path.join(require('os').tmpdir(), `wa_audio_${Date.now()}.ogg`);
-      fs.writeFileSync(tmpFile, Buffer.from(media.data, 'base64'));
+  // Аудио/голосовое/кружочек → транскрипция
+  if (audioMedia) {
+    const tmpFile = path.join(os.tmpdir(), `wa_audio_${Date.now()}.ogg`);
+    try {
+      const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+        reuploadRequest: sock.updateMediaMessage
+      });
+      fs.writeFileSync(tmpFile, buffer);
 
-      console.log(`[<<] Аудио от ${msg.from}, транскрибация...`);
+      console.log(`[<<] Аудио от ${chatId}, транскрибация...`);
       const result = await transcribeAudio(tmpFile);
       text = result.text;
       detectedLang = result.lang;
-
-      // Удаляем временный файл
-      try { fs.unlinkSync(tmpFile); } catch (e) {}
 
       if (!text || !text.trim()) {
         console.log('  [!] Пустая транскрипция, пропускаем');
         return;
       }
-
       console.log(`  [aai] Транскрипция: "${text.substring(0, 100)}..." (${detectedLang})`);
-    } else {
-      return; // Не аудио медиа — пропускаем
+    } finally {
+      try { fs.unlinkSync(tmpFile); } catch (e) {}
     }
   }
 
   if (!text || !text.trim()) return;
 
-  // Определяем язык если ещё не определён
-  if (!detectedLang) {
-    detectedLang = detectLanguage(text);
-  }
+  if (!detectedLang) detectedLang = detectLanguage(text);
 
-  // Нормализуем язык
+  // Нормализация
   if (detectedLang === 'russian') detectedLang = 'ru';
   if (detectedLang === 'english') detectedLang = 'en';
   if (detectedLang === 'indonesian') detectedLang = 'id';
 
-  // Входящее сообщение → переводим на русский (для меня)
+  // Переводим на русский если не русский
   if (detectedLang !== MY_LANG && detectedLang !== 'unknown') {
-    const translationResult = await translateText(text, detectedLang, MY_LANG);
-    const translation = translationResult.text;
-    detectedLang = translationResult.detectedLang || detectedLang;
+    const tr = await translateText(text, detectedLang, MY_LANG);
+    const translation = tr.text;
+    detectedLang = tr.detectedLang || detectedLang;
 
-    let replyText = '';
-    if (msg.hasMedia) {
-      // Для аудио: показываем транскрипцию + перевод
-      replyText = `📝 [${detectedLang.toUpperCase()}]: ${text}\n\n🌐 [RU]: ${translation}`;
-    } else {
-      replyText = `🌐 [RU]: ${translation}`;
-    }
+    const replyText = audioMedia
+      ? `📝 [${detectedLang.toUpperCase()}]: ${text}\n\n🌐 [RU]: ${translation}`
+      : `🌐 [RU]: ${translation}`;
 
-    await msg.reply(replyText);
+    await sock.sendMessage(chatId, { text: replyText }, { quoted: msg });
     console.log(`[<<] Перевод входящего (${detectedLang}→ru): ${translation.substring(0, 80)}`);
 
-    // TTS озвучка перевода
     if (settings.tts) {
       try {
         const audioPath = await generateAudio(translation, MY_LANG);
-        const audioMedia = MessageMedia.fromFilePath(audioPath);
-        await client.sendMessage(msg.from, audioMedia, { sendAudioAsVoice: true });
+        const audioBuffer = fs.readFileSync(audioPath);
+        await sock.sendMessage(chatId, {
+          audio: audioBuffer,
+          mimetype: 'audio/mp4',
+          ptt: true
+        });
         try { fs.unlinkSync(audioPath); } catch (e) {}
       } catch (ttsErr) {
         console.error(`  [tts] Ошибка озвучки: ${ttsErr.message}`);
       }
     }
   } else if (detectedLang === 'unknown') {
-    // Язык не определён по эвристике — пусть GPT сам разберётся
-    const translationResult = await translateText(text, 'auto', MY_LANG);
-    const translation = translationResult.text;
-    const actualLang = translationResult.detectedLang || 'auto';
-    await msg.reply(`📝 [${actualLang.toUpperCase()}]: ${text}\n\n🌐 [RU]: ${translation}`);
+    const tr = await translateText(text, 'auto', MY_LANG);
+    const translation = tr.text;
+    const actualLang = tr.detectedLang || 'auto';
+    await sock.sendMessage(chatId, {
+      text: `📝 [${actualLang.toUpperCase()}]: ${text}\n\n🌐 [RU]: ${translation}`
+    }, { quoted: msg });
     console.log(`[<<] Перевод (${actualLang}→ru): ${translation.substring(0, 80)}`);
   }
-  // Если сообщение на русском от собеседника — не переводим (редкий кейс)
 }
 
-// === CATCHUP ПРОПУЩЕННЫХ ===
-async function catchUpTranslations() {
-  console.log('Проверяю пропущенные сообщения для перевода...\n');
-  let found = 0;
+// === ОБРАБОТКА ИСХОДЯЩЕГО (моё сообщение) ===
+async function processOutgoing(sock, msg, settings) {
+  const chatId = msg.key.remoteJid;
+  const text = extractText(msg);
+  const audioMedia = getAudioMedia(msg);
 
-  try {
-    const chats = await client.getChats();
+  // Не переводим если это уже перевод от бота
+  if (text && (text.startsWith('🌐') || text.startsWith('📝'))) return;
 
-    for (const chat of chats) {
-      if (chat.isGroup) continue;
-      const chatId = chat.id._serialized;
-      const settings = chatSettings[chatId];
-      if (!settings || !settings.enabled) continue;
+  // Моё аудио → транскрипция + перевод на язык чата
+  if (audioMedia) {
+    const tmpFile = path.join(os.tmpdir(), `wa_my_audio_${Date.now()}.ogg`);
+    try {
+      const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+        reuploadRequest: sock.updateMediaMessage
+      });
+      fs.writeFileSync(tmpFile, buffer);
 
-      if (!chat.lastMessage) continue;
-      if (chat.lastMessage.fromMe) continue;
-      if (!chat.lastMessage.body && !chat.lastMessage.hasMedia) continue;
+      console.log(`[>>] Моё аудио, транскрибация...`);
+      const result = await transcribeAudio(tmpFile);
 
-      // Проверяем: сообщение непрочитано?
-      if (chat.unreadCount > 0) {
-        found++;
-        console.log(`[!!] Непрочитано в ${chatId}: ${chat.unreadCount} сообщ.`);
+      if (result.text && result.text.trim()) {
+        const tr = await translateText(result.text, result.lang || 'ru', settings.targetLang);
+        let translation = tr.text.replace(/\.$/, '');
+        await sock.sendMessage(chatId, { text: `🌐 ${translation}` });
+        console.log(`[>>] Моё аудио (${result.lang}→${settings.targetLang}): ${translation.substring(0, 80)}`);
+      }
+    } finally {
+      try { fs.unlinkSync(tmpFile); } catch (e) {}
+    }
+    return;
+  }
 
-        const lastMsg = chat.lastMessage;
-        if (lastMsg.body || lastMsg.hasMedia) {
-          try {
-            await processMessage(lastMsg, settings);
-          } catch (err) {
-            console.error(`  [!] Ошибка catchup: ${err.message}`);
-          }
-        }
+  // Мой текст на русском → перевод и edit (или новое сообщение если edit не сработал)
+  if (text && text.trim()) {
+    const sourceLang = detectLanguage(text);
+    if (sourceLang === MY_LANG) {
+      const tr = await translateText(text, 'ru', settings.targetLang);
+      let translation = tr.text.replace(/\.$/, '');
+
+      // Baileys: edit работает везде, включая @lid
+      try {
+        await sock.sendMessage(chatId, { text: translation, edit: msg.key });
+        console.log(`[>>] EDIT (ru→${settings.targetLang}): ${translation.substring(0, 80)}`);
+      } catch (editErr) {
+        // Если edit не сработал — отправляем новое сообщение
+        await sock.sendMessage(chatId, { text: `🌐 ${translation}` });
+        console.log(`[>>] Мой текст (ru→${settings.targetLang}, edit fail): ${translation.substring(0, 80)}`);
       }
     }
-  } catch (err) {
-    console.error(`[!] Ошибка catchup: ${err.message}`);
-  }
-
-  if (found === 0) {
-    console.log('Непереведённых сообщений нет.\n');
-  } else {
-    console.log(`Обработано ${found} чатов с непрочитанными.\n`);
   }
 }
 
-// === ТЕРМИНАЛ (только в интерактивном режиме) ===
+// === ROUTER: единая точка входа для всех сообщений ===
+async function routeMessage(sock, msg) {
+  if (!msg.message) return;
+  if (msg.key.remoteJid === 'status@broadcast') return;
+  if (msg.key.remoteJid?.endsWith('@g.us')) return; // игнорируем группы
+
+  const chatId = msg.key.remoteJid;
+  const text = extractText(msg);
+
+  // Команды (от меня или в этом чате)
+  if (text && isCommand(text)) {
+    // Команды разрешены только мне (fromMe) или в личке если бот один там
+    if (msg.key.fromMe) {
+      await handleCommand(sock, msg, text);
+      return;
+    }
+  }
+
+  const settings = getChatSettingsForId(chatId);
+  if (!settings || !settings.enabled) return;
+
+  // Дебаунс
+  if (text && isDuplicate(chatId, text)) {
+    console.log(`  [skip] Дубль от ${chatId}`);
+    return;
+  }
+
+  // Защита от параллельной обработки
+  const lockKey = chatId + (msg.key.fromMe ? '_out' : '_in');
+  if (processingChats.has(lockKey)) return;
+  processingChats.add(lockKey);
+
+  try {
+    if (msg.key.fromMe) {
+      await processOutgoing(sock, msg, settings);
+    } else {
+      await processIncoming(sock, msg, settings);
+    }
+  } catch (err) {
+    console.error(`[!] Ошибка обработки: ${err.message}`);
+  } finally {
+    processingChats.delete(lockKey);
+  }
+}
+
+// === ПОДКЛЮЧЕНИЕ К WHATSAPP (Baileys) ===
+let reconnectAttempt = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
+const BACKOFF_MS = [30_000, 60_000, 120_000, 300_000, 900_000];
+let isReconnecting = false;
+
+async function connectWhatsApp() {
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  const { version, isLatest } = await fetchLatestBaileysVersion();
+  console.log(`Baileys WA Web v${version.join('.')} (latest: ${isLatest})`);
+
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    logger: pino({ level: 'silent' }),
+    browser: ['Translator', 'Chrome', '1.0.0'],
+    markOnlineOnConnect: false,
+    syncFullHistory: false,
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      console.log('\n=== СКАНИРУЙ QR КОД ===\n');
+      qrcode.generate(qr, { small: true });
+      console.log('\nWhatsApp → Настройки → Связанные устройства → Привязать устройство\n');
+    }
+
+    if (connection === 'close') {
+      const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      const reasonName = Object.keys(DisconnectReason).find(k => DisconnectReason[k] === code) || `code ${code}`;
+      console.log(`[!] Отключён. Причина: ${reasonName} (${code})`);
+
+      // LOGGED OUT / forbidden / badSession — не реконнектим, эскалирует
+      if (code === DisconnectReason.loggedOut
+          || code === DisconnectReason.forbidden
+          || code === DisconnectReason.badSession) {
+        console.log('[!] WhatsApp выкинул сессию. Удали .baileys_auth/ и пересканируй QR.');
+        setTimeout(() => process.exit(1), 500);
+        return;
+      }
+
+      if (isReconnecting) return;
+
+      // restartRequired (515) / timedOut / connectionLost — требуют МГНОВЕННОГО реконнекта
+      // (если ждать долго, WhatsApp сбрасывает state и присылает loggedOut)
+      const isFastReconnect =
+        code === DisconnectReason.restartRequired
+        || code === DisconnectReason.timedOut
+        || code === DisconnectReason.connectionLost
+        || code === DisconnectReason.connectionClosed;
+
+      if (isFastReconnect) {
+        isReconnecting = true;
+        console.log(`[~] Быстрый реконнект через 1.5s (${reasonName})`);
+        setTimeout(() => {
+          isReconnecting = false;
+          connectWhatsApp().catch(err => {
+            console.error('[!] Ошибка реконнекта:', err.message);
+            setTimeout(() => process.exit(1), 500);
+          });
+        }, 1500);
+        return;
+      }
+
+      // Прочие причины — exponential backoff
+      if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+        console.log(`[!] Достигнут лимит реконнектов (${MAX_RECONNECT_ATTEMPTS}). Выхожу.`);
+        setTimeout(() => process.exit(1), 500);
+        return;
+      }
+      isReconnecting = true;
+      const delay = BACKOFF_MS[reconnectAttempt];
+      reconnectAttempt++;
+      console.log(`[~] Попытка реконнекта ${reconnectAttempt}/${MAX_RECONNECT_ATTEMPTS} через ${delay/1000}s`);
+      setTimeout(() => {
+        isReconnecting = false;
+        connectWhatsApp().catch(err => {
+          console.error('[!] Ошибка реконнекта:', err.message);
+          setTimeout(() => process.exit(1), 500);
+        });
+      }, delay);
+    } else if (connection === 'open') {
+      reconnectAttempt = 0;
+      console.log('\n=== WhatsApp Translator подключён! ===\n');
+      console.log(`Мой ID: ${sock.user?.id}`);
+      console.log(`Имя: ${sock.user?.name || '—'}\n`);
+      console.log('Команды в чате:');
+      console.log('  #translate      — включить переводчик');
+      console.log('  #translate en   — включить + язык ответов');
+      console.log('  #stop           — выключить');
+      console.log('  #tts on/off     — озвучка');
+      console.log('  #status         — настройки чата\n');
+      console.log('Терминал:');
+      console.log('  status          — все чаты с переводом');
+      console.log('  quit            — выход\n');
+      if (process.stdin.isTTY) promptUser();
+    }
+  });
+
+  // Главный обработчик сообщений
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    // 'notify' — реальное время; 'append' — догрузка пропущенных при reconnect (catchup)
+    if (type !== 'notify' && type !== 'append') return;
+    for (const msg of messages) {
+      try {
+        await routeMessage(sock, msg);
+      } catch (err) {
+        console.error(`[!] routeMessage error: ${err.message}`);
+      }
+    }
+  });
+
+  return sock;
+}
+
+// === ТЕРМИНАЛ ===
 let rl;
+let currentSock = null;
 if (process.stdin.isTTY) {
   const readline = require('readline');
   rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 }
 
 function promptUser() {
+  if (!rl) return;
   rl.question('translator> ', async (input) => {
     const cmd = input.trim();
     if (!cmd) { promptUser(); return; }
-
     switch (cmd) {
       case 'status':
         console.log('\n=== ЧАТЫ С ПЕРЕВОДОМ ===\n');
@@ -617,34 +618,34 @@ function promptUser() {
           console.log('');
         }
         break;
-      case 'catchup':
-        await catchUpTranslations();
-        break;
       case 'quit':
       case 'exit':
         console.log('Выход...');
         saveSettings();
-        await client.destroy();
+        if (currentSock) { try { await currentSock.end(); } catch (e) {} }
         process.exit(0);
-        break;
       default:
-        console.log('Команды: status, catchup, quit');
+        console.log('Команды: status, quit');
     }
-    if (process.stdin.isTTY) { promptUser(); }
+    if (process.stdin.isTTY) promptUser();
   });
 }
 
 // === ЗАПУСК ===
-console.log('=== WhatsApp Translator ===');
+console.log('=== WhatsApp Translator (Baileys) ===');
 console.log('AssemblyAI + GPT + TTS\n');
 
 loadSettings();
 
 process.on('unhandledRejection', (err) => {
-  console.error('[!] Unhandled rejection:', err);
-  // exit с failure чтобы systemd применил RestartSec (важно для snap chromium scope drain)
+  console.error('[!] Unhandled rejection:', err?.message || err);
   setTimeout(() => process.exit(1), 100);
 });
 
 console.log('Подключение к WhatsApp...\n');
-client.initialize();
+connectWhatsApp()
+  .then(sock => { currentSock = sock; })
+  .catch(err => {
+    console.error('[!] Ошибка запуска:', err);
+    process.exit(1);
+  });

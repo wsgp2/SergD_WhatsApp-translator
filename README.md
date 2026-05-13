@@ -6,10 +6,13 @@ WhatsApp бот-переводчик: автоматический перево�
 
 - **Входящие** сообщения (текст/аудио/видеокружочки) → переводятся на **русский**
 - **Исходящие** сообщения на русском → переводятся на **язык чата** (по умолчанию English)
-- Работает через `whatsapp-web.js` (эмуляция WhatsApp Web через headless Chromium)
+- Работает через `@whiskeysockets/baileys` 7.x (прямой WebSocket к WhatsApp Multi-Device, **без браузера/Chromium**, ~100MB RAM)
 - Использует AssemblyAI (primary) + OpenAI Whisper (fallback) для транскрипции аудио
 - Использует GPT-5.4-mini для перевода с автоопределением языка
 - Использует gpt-4o-mini-tts для озвучки переводов (опционально)
+- Edit сообщений работает везде (включая `@lid` чаты — `whatsapp-web.js` там не справлялся)
+
+> **История:** до v2.0 (май 2026) использовался `whatsapp-web.js` + headless Brave/Chromium. Из-за snap-confine/cgroup конфликтов и WhatsApp anti-bot detection — постоянные LOGOUT. Мигрировано на Baileys 13.05.2026.
 
 ## Команды в чате
 
@@ -27,9 +30,9 @@ WhatsApp бот-переводчик: автоматический перево�
 ## Установка
 
 ### Требования
-- Node.js >= 18
-- Chromium (`apt install chromium-browser`)
+- Node.js >= 20
 - Аккаунт WhatsApp (для привязки как второе устройство)
+- _Никаких системных зависимостей кроме Node — Chromium больше НЕ нужен._
 
 ### Шаги
 
